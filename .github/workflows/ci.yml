@@ -1,0 +1,41 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  smoke:
+    # No daemon in CI, so the smoke test proves the install path works on
+    # both architectures and the run step executes: `version` needs no daemon.
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          command: version
+
+  pinned-install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          command: version
+          version: v0.4.1
+
+  daemon-required:
+    # Commands other than `version` must fail fast with a clear error
+    # when no daemon input is given.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        id: push
+        continue-on-error: true
+        with:
+          command: status
+      - run: test "${{ steps.push.outcome }}" = "failure"
