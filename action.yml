@@ -1,0 +1,124 @@
+name: hotlane
+author: Stefan Iancu
+description: Deploy with hotlane - git delta to a verified running fork to traffic flip, in seconds
+branding:
+  icon: zap
+  color: orange
+
+inputs:
+  daemon:
+    description: >-
+      Daemon URL (e.g. https://deploy.example.com). Required for every
+      command except `version`.
+    required: false
+  token:
+    description: Bearer token for the daemon API (HOTLANE_TOKEN).
+    required: false
+  command:
+    description: >-
+      hotlane command to run: push (default), test, promote, discard,
+      rollback, drift, status, version.
+    required: false
+    default: push
+  args:
+    description: Extra arguments appended to the command (e.g. a rollback version).
+    required: false
+    default: ""
+  version:
+    description: hotlane release to install (e.g. v0.4.2), or latest.
+    required: false
+    default: latest
+  working-directory:
+    description: Directory containing the app checkout (where push computes its git delta).
+    required: false
+    default: "."
+
+outputs:
+  version:
+    description: The app version the command produced or acted on (push/test/promote/rollback).
+    value: ${{ steps.run.outputs.version }}
+  promoted:
+    description: '"true" when a push was verified and promoted.'
+    value: ${{ steps.run.outputs.promoted }}
+  json:
+    description: The command's full -json output (single line).
+    value: ${{ steps.run.outputs.json }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install hotlane
+      shell: bash
+      env:
+        HOTLANE_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        case "$(uname -m)" in
+          x86_64)  arch=amd64 ;;
+          aarch64|arm64) arch=arm64 ;;
+          *) echo "::error::unsupported runner architecture: $(uname -m)"; exit 1 ;;
+        esac
+        case "$(uname -s)" in
+          Linux)  os=linux ;;
+          Darwin) os=darwin ;;
+          *) echo "::error::unsupported runner OS: $(uname -s)"; exit 1 ;;
+        esac
+        if [ "$HOTLANE_VERSION" = "latest" ]; then
+          url="https://github.com/StefanIancu/hotlane/releases/latest/download/hotlane_${os}_${arch}.tar.gz"
+        else
+          v="${HOTLANE_VERSION#v}"
+          url="https://github.com/StefanIancu/hotlane/releases/download/v${v}/hotlane_${os}_${arch}.tar.gz"
+        fi
+        dest="$RUNNER_TEMP/hotlane-bin"
+        mkdir -p "$dest"
+        curl -fsSL --retry 3 "$url" | tar -xz -C "$dest" hotlane
+        echo "$dest" >> "$GITHUB_PATH"
+        "$dest/hotlane" version
+
+    - name: Run hotlane ${{ inputs.command }}
+      id: run
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        HOTLANE_DAEMON: ${{ inputs.daemon }}
+        HOTLANE_TOKEN: ${{ inputs.token }}
+        CMD: ${{ inputs.command }}
+        EXTRA_ARGS: ${{ inputs.args }}
+      run: |
+        set -uo pipefail
+        if [ -z "$HOTLANE_DAEMON" ] && [ "$CMD" != "version" ]; then
+          echo "::error::the 'daemon' input is required for 'hotlane $CMD'"
+          exit 1
+        fi
+        # version takes no -json; everything state-touching does.
+        json_flag="-json"
+        [ "$CMD" = "version" ] && json_flag=""
+        out="$RUNNER_TEMP/hotlane-out.json"
+        hotlane "$CMD" $json_flag $EXTRA_ARGS | tee "$out"
+        code=${PIPESTATUS[0]}
+
+        # Outputs + job summary from whatever JSON came back (best effort:
+        # a rejected push still exits non-zero below, with outputs set).
+        if jq -e . "$out" >/dev/null 2>&1; then
+          echo "json=$(jq -c . "$out")" >> "$GITHUB_OUTPUT"
+          echo "version=$(jq -r '.version // empty' "$out")" >> "$GITHUB_OUTPUT"
+          echo "promoted=$(jq -r '.promoted // empty' "$out")" >> "$GITHUB_OUTPUT"
+          {
+            if [ "$(jq -r '.promoted // empty' "$out")" = "true" ]; then
+              echo "### hotlane: PROMOTED v$(jq -r .version "$out") :zap:"
+              echo ""
+              echo "snapshot $(jq -r .snapshot_ms "$out")ms / patch $(jq -r .patch_ms "$out")ms / boot $(jq -r .boot_ms "$out")ms / verify $(jq -r .verify_ms "$out")ms / total $(jq -r .total_ms "$out")ms"
+            elif [ "$code" -ne 0 ]; then
+              echo "### hotlane: $CMD failed"
+            else
+              echo "### hotlane: $CMD ok"
+            fi
+            if jq -e '.verify and (.verify | length > 0)' "$out" >/dev/null 2>&1; then
+              echo ""
+              echo "| verify hook | ok | ms | detail |"
+              echo "|---|---|---|---|"
+              jq -r '.verify[] | "| \(.hook) | \(if .ok then ":white_check_mark:" else ":x:" end) | \(.ms) | \(.detail // "") |"' "$out"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi
+        exit "$code"
