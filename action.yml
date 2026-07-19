@@ -1,4 +1,4 @@
-name: hotlane
+name: hotlane deploy
 author: Stefan Iancu
 description: Deploy with hotlane - git delta to a verified running fork to traffic flip, in seconds
 branding:
